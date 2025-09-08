@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ASN Bank History Saver
 // @namespace    http://tampermonkey.net/
-// @version      1.11
+// @version      1.12
 // @description  Export bank transactions with date range, format options, and optional statistics. Tracks actual first/last scanned dates and duration + ETA estimation.
 // @match        https://www.regiobank.nl/online/web/mijnregiobank/*
 // @match        https://www.snsbank.nl/online/web/mijnsns/*
@@ -149,179 +149,7 @@
         return `${s}s`;
     }
 
-    // --- Robust loader with ETA + actual first/last scanned ---
-    async function loadAllTransactions(startDate, endDate, format, calcStats) {
-        const collected = [];
-        const seenKeys = new Set();
-        const scrollContainer = findScrollContainer();
-        console.log('Using scroll container:', scrollContainer === window ? 'window' : scrollContainer);
-
-        let scrollAttempts = 0;
-        const maxScrollAttempts = 200;
-        let noNewDataRetries = 0;
-        const maxNoNewDataRetries = 3;
-
-        let prevOldestSeen = null;
-        let scannedMinDate = null; // oldest scanned (actualLastScanned)
-        let scannedMaxDate = null; // newest scanned (actualFirstScanned)
-        const startTimestamp = Date.now();
-
-        const msPerDay = 1000 * 60 * 60 * 24;
-
-        const keyFor = (t) => {
-            const dateStr = t.date.toISOString().split('T')[0];
-            return `${dateStr}|${t.description}|${t.amount.toFixed(2)}`;
-        };
-
-        function computeOldestOnPage(txs) {
-            if (!txs || txs.length === 0) return null;
-            let oldest = txs[0].date;
-            txs.forEach(t => { if (t.date < oldest) oldest = t.date; });
-            return oldest;
-        }
-        function computeNewestOnPage(txs) {
-            if (!txs || txs.length === 0) return null;
-            let newest = txs[0].date;
-            txs.forEach(t => { if (t.date > newest) newest = t.date; });
-            return newest;
-        }
-
-        while (true) {
-            const txs = extractTransactions();
-            const oldestOnPage = computeOldestOnPage(txs) || endDate;
-            const newestOnPage = computeNewestOnPage(txs) || startDate;
-
-            // update scanned min/max from everything we've seen on page
-            if (!scannedMinDate || oldestOnPage < scannedMinDate) scannedMinDate = oldestOnPage;
-            if (!scannedMaxDate || newestOnPage > scannedMaxDate) scannedMaxDate = newestOnPage;
-
-            // add unique transactions to collected (within requested window)
-            let newUniqueAdded = false;
-            txs.forEach(t => {
-                const key = keyFor(t);
-                if (!seenKeys.has(key)) {
-                    seenKeys.add(key);
-                    if (t.date >= endDate && t.date <= startDate) collected.push(t);
-                    newUniqueAdded = true;
-                }
-            });
-
-            // detect real progress in oldest date
-            let progressed = false;
-            if (!prevOldestSeen) {
-                prevOldestSeen = oldestOnPage;
-                progressed = true;
-            } else if (oldestOnPage < prevOldestSeen) {
-                prevOldestSeen = oldestOnPage;
-                progressed = true;
-            }
-
-            // estimation calculation
-            const now = Date.now();
-            const elapsedSec = (now - startTimestamp) / 1000;
-            let etaHuman = 'N/A';
-            if (scannedMinDate && scannedMaxDate && scannedMaxDate.getTime() !== scannedMinDate.getTime()) {
-                const daysCovered = (scannedMaxDate - scannedMinDate) / msPerDay;
-                if (daysCovered > 0 && elapsedSec > 1) {
-                    const secondsPerDay = elapsedSec / daysCovered;
-                    const remainingDays = Math.max(0, (scannedMinDate - endDate) / msPerDay);
-                    const estimatedRemainingSec = secondsPerDay * remainingDays;
-                    etaHuman = humanDuration(estimatedRemainingSec);
-                }
-            }
-
-            // only reset noNewDataRetries when real progress was made (older date found)
-            if (progressed) {
-                noNewDataRetries = 0;
-            }
-
-            console.log(`Collected ${collected.length} transactions. Oldest on page: ${oldestOnPage.toISOString().split('T')[0]}. PrevOldestSeen: ${prevOldestSeen.toISOString().split('T')[0]}. Scroll attempts: ${scrollAttempts}. noNewDataRetries: ${noNewDataRetries}. ETA: ${etaHuman}`);
-
-            // termination checks
-            if (oldestOnPage < endDate) {
-                console.log('Stopping reason: oldestOnPage < endDate');
-                break;
-            }
-            if (scrollAttempts >= maxScrollAttempts) {
-                console.log('Stopping reason: reached max scroll attempts');
-                break;
-            }
-
-            // scroll
-            try {
-                if (scrollContainer === window) {
-                    window.scrollTo(0, document.body.scrollHeight || document.documentElement.scrollHeight);
-                } else {
-                    scrollContainer.scrollTop = scrollContainer.scrollHeight;
-                }
-            } catch (e) { }
-
-            scrollAttempts++;
-
-            // wait for mutations
-            const mutated = await waitForMutations(scrollContainer, 4500);
-            if (mutated) {
-                await sleep(400);
-                continue;
-            } else {
-                noNewDataRetries++;
-                console.log(`No DOM changes detected after scroll. noNewDataRetries=${noNewDataRetries}`);
-
-                // nudge trick
-                try {
-                    if (scrollContainer === window) {
-                        window.scrollBy(0, -60);
-                        await sleep(200);
-                        window.scrollBy(0, 120);
-                    } else {
-                        scrollContainer.scrollTop = Math.max(0, scrollContainer.scrollTop - 60);
-                        await sleep(200);
-                        scrollContainer.scrollTop = scrollContainer.scrollHeight;
-                    }
-                    const mutated2 = await waitForMutations(scrollContainer, 3000);
-                    if (mutated2) { await sleep(300); continue; }
-                } catch (e) { }
-
-                if (noNewDataRetries >= maxNoNewDataRetries) {
-                    console.log('Stopping reason: too many no-new-data retries (no further progress detected)');
-                    break;
-                }
-
-                await sleep(500);
-                continue;
-            }
-        }
-
-        // finalize export, compute duration and add actual first/last scanned
-        const endTimestamp = Date.now();
-        const timeTakenSec = (endTimestamp - startTimestamp) / 1000;
-        const timeTakenHuman = humanDuration(timeTakenSec);
-
-        const now = new Date();
-        const dateStr = formatDateInput(now);
-        if (format === 'csv') {
-            downloadFile(toCSV(collected), `${filenamePrefix}_${dateStr}.csv`, 'text/csv');
-        } else {
-            const jsonData = {
-                exportedAt: now.toISOString(),
-                startDate: formatDateInput(startDate),
-                endDate: formatDateInput(endDate),
-                actualFirstScanned: scannedMaxDate ? formatDateInput(scannedMaxDate) : null,
-                actualLastScanned: scannedMinDate ? formatDateInput(scannedMinDate) : null,
-                timeTakenSeconds: timeTakenSec,
-                timeTakenHuman: timeTakenHuman,
-                category: category,
-                pageUrl: pageUrl,
-                stats: calcStats ? calculateStats(collected) : {},
-                transactions: collected
-            };
-            downloadFile(JSON.stringify(jsonData, null, 2), `${filenamePrefix}_${dateStr}.json`, 'application/json');
-        }
-
-        console.log(`Export complete. Total transactions exported: ${collected.length}. Time taken: ${timeTakenHuman}`);
-    }
-
-    // --- Overlay UI ---
+    // --- Overlay UI with progress bar ---
     function createOverlay() {
         const overlay = document.createElement('div');
         overlay.style.position = 'fixed';
@@ -345,49 +173,53 @@
         title.style.margin = '0 0 10px 0';
         overlay.appendChild(title);
 
-        // --- Name Input ---
-        const nameLabel = document.createElement('label');
-        nameLabel.textContent = 'Bestandsnaam: ';
-        const nameInput = document.createElement('input');
-        nameInput.type = 'text';
-        nameInput.value = 'spaarrekening_export'; // default name
-        nameLabel.appendChild(nameInput);
-        overlay.appendChild(nameLabel);
-        overlay.appendChild(document.createElement('br'));
-        overlay.appendChild(document.createElement('br'));
+        // --- Inputs ---
+        const createInput = (labelText, type, defaultValue) => {
+            const label = document.createElement('label');
+            label.textContent = labelText;
+            const input = document.createElement(type === 'select' ? 'select' : 'input');
+            if (type !== 'select') input.type = type;
+            if (defaultValue) input.value = defaultValue;
+            label.appendChild(input);
+            overlay.appendChild(label);
+            overlay.appendChild(document.createElement('br'));
+            overlay.appendChild(document.createElement('br'));
+            return input;
+        };
 
-        // --- Category Input ---
-        const categoryLabel = document.createElement('label');
-        categoryLabel.textContent = 'Categorie: ';
-        const categoryInput = document.createElement('input');
-        categoryInput.type = 'text';
-        categoryInput.value = 'spaarrekening';
-        categoryLabel.appendChild(categoryInput);
-        overlay.appendChild(categoryLabel);
-        overlay.appendChild(document.createElement('br'));
-        overlay.appendChild(document.createElement('br'));
+        const nameInput = createInput('Bestandsnaam: ', 'text', 'spaarrekening_export');
+        const categoryInput = createInput('Categorie: ', 'text', 'spaarrekening');
+        const startInput = createInput('Startdatum: ', 'date', formatDateInput(tomorrow));
+        const endInput = createInput('Einddatum: ', 'date', formatDateInput(startOfYear));
 
-        // --- Date Inputs ---
-        const startLabel = document.createElement('label'); startLabel.textContent = 'Startdatum: ';
-        const startInput = document.createElement('input'); startInput.type = 'date'; startInput.value = formatDateInput(tomorrow);
-        startLabel.appendChild(startInput); overlay.appendChild(startLabel);
-        overlay.appendChild(document.createElement('br')); overlay.appendChild(document.createElement('br'));
-
-        const endLabel = document.createElement('label'); endLabel.textContent = 'Einddatum: ';
-        const endInput = document.createElement('input'); endInput.type = 'date'; endInput.value = formatDateInput(startOfYear);
-        endLabel.appendChild(endInput); overlay.appendChild(endLabel);
-        overlay.appendChild(document.createElement('br')); overlay.appendChild(document.createElement('br'));
-
-        const formatLabel = document.createElement('label'); formatLabel.textContent = 'Formaat: ';
+        const formatLabel = document.createElement('label');
+        formatLabel.textContent = 'Formaat: ';
         const formatSelect = document.createElement('select');
         const optJson = document.createElement('option'); optJson.value = 'json'; optJson.textContent = 'JSON'; optJson.selected = true;
         const optCsv = document.createElement('option'); optCsv.value = 'csv'; optCsv.textContent = 'CSV';
-        formatSelect.appendChild(optJson); formatSelect.appendChild(optCsv); formatLabel.appendChild(formatSelect);
+        formatSelect.appendChild(optJson); formatSelect.appendChild(optCsv);
+        formatLabel.appendChild(formatSelect);
         overlay.appendChild(formatLabel); overlay.appendChild(document.createElement('br')); overlay.appendChild(document.createElement('br'));
 
         const statsLabel = document.createElement('label'); statsLabel.textContent = 'Calculated Statistics: ';
         const statsCheckbox = document.createElement('input'); statsCheckbox.type = 'checkbox';
         statsLabel.appendChild(statsCheckbox); overlay.appendChild(statsLabel); overlay.appendChild(document.createElement('br')); overlay.appendChild(document.createElement('br'));
+
+        // --- Progress Bar ---
+        const progressContainer = document.createElement('div');
+        progressContainer.style.width = '100%';
+        progressContainer.style.height = '20px';
+        progressContainer.style.background = '#eee';
+        progressContainer.style.border = '1px solid #ccc';
+        progressContainer.style.borderRadius = '5px';
+        progressContainer.style.margin = '10px 0';
+        const progressBar = document.createElement('div');
+        progressBar.style.height = '100%';
+        progressBar.style.width = '0%';
+        progressBar.style.background = '#4caf50';
+        progressBar.style.borderRadius = '5px';
+        progressContainer.appendChild(progressBar);
+        overlay.appendChild(progressContainer);
 
         const exportBtn = document.createElement('button'); exportBtn.textContent = 'Exporteren';
         overlay.appendChild(exportBtn);
@@ -399,6 +231,10 @@
 
         document.body.appendChild(overlay);
 
+        function setInputsDisabled(disabled) {
+            [nameInput, categoryInput, startInput, endInput, formatSelect, statsCheckbox, exportBtn].forEach(el => el.disabled = disabled);
+        }
+
         exportBtn.addEventListener('click', () => {
             const startDate = new Date(startInput.value);
             const endDate = new Date(endInput.value);
@@ -407,11 +243,142 @@
             const filenamePrefix = (nameInput.value || 'export').trim();
             const category = (categoryInput.value || '').trim();
             const pageUrl = window.location.href; // automatically save current page URL
-            loadAllTransactions(startDate, endDate, format, calcStats, filenamePrefix, category, pageUrl);
+
+            setInputsDisabled(true);
+            progressBar.style.width = '0%';
+
+            // Wrap original loader to report progress
+            loadAllTransactions(startDate, endDate, format, calcStats, filenamePrefix, category, pageUrl, (progressFraction) => {
+                progressBar.style.width = `${Math.round(progressFraction * 100)}%`;
+            }).finally(() => setInputsDisabled(false));
         });
     }
 
+    // --- Loader update to support progress callback ---
+    async function loadAllTransactions(startDate, endDate, format, calcStats, filenamePrefix, category, pageUrl, onProgress) {
+        const collected = [];
+        const seenKeys = new Set();
+        const scrollContainer = findScrollContainer();
+        console.log('Using scroll container:', scrollContainer === window ? 'window' : scrollContainer);
 
+        let scrollAttempts = 0;
+        const maxScrollAttempts = 200;
+        let noNewDataRetries = 0;
+        const maxNoNewDataRetries = 3;
+
+        let prevOldestSeen = null;
+        let scannedMinDate = null;
+        let scannedMaxDate = null;
+        const startTimestamp = Date.now();
+        const msPerDay = 1000 * 60 * 60 * 24;
+
+        const keyFor = (t) => `${t.date.toISOString().split('T')[0]}|${t.description}|${t.amount.toFixed(2)}`;
+
+        function computeOldestOnPage(txs) {
+            if (!txs || txs.length === 0) return null;
+            return txs.reduce((oldest, t) => t.date < oldest ? t.date : oldest, txs[0].date);
+        }
+        function computeNewestOnPage(txs) {
+            if (!txs || txs.length === 0) return null;
+            return txs.reduce((newest, t) => t.date > newest ? t.date : newest, txs[0].date);
+        }
+
+        while (true) {
+            const txs = extractTransactions();
+            const oldestOnPage = computeOldestOnPage(txs) || endDate;
+            const newestOnPage = computeNewestOnPage(txs) || startDate;
+
+            if (!scannedMinDate || oldestOnPage < scannedMinDate) scannedMinDate = oldestOnPage;
+            if (!scannedMaxDate || newestOnPage > scannedMaxDate) scannedMaxDate = newestOnPage;
+
+            let newUniqueAdded = false;
+            txs.forEach(t => {
+                const key = keyFor(t);
+                if (!seenKeys.has(key)) {
+                    seenKeys.add(key);
+                    if (t.date >= endDate && t.date <= startDate) collected.push(t);
+                    newUniqueAdded = true;
+                }
+            });
+
+            let progressed = false;
+            if (!prevOldestSeen) {
+                prevOldestSeen = oldestOnPage;
+                progressed = true;
+            } else if (oldestOnPage < prevOldestSeen) {
+                prevOldestSeen = oldestOnPage;
+                progressed = true;
+            }
+
+            // update progress
+            if (onProgress && scannedMinDate && scannedMaxDate) {
+                const totalRange = startDate - endDate;
+                const covered = scannedMaxDate - scannedMinDate;
+                let fraction = Math.min(Math.max(covered / totalRange, 0), 1);
+                onProgress(fraction);
+            }
+
+            const now = Date.now();
+            const elapsedSec = (now - startTimestamp) / 1000;
+
+            if (oldestOnPage < endDate || scrollAttempts >= maxScrollAttempts) break;
+
+            try {
+                if (scrollContainer === window) {
+                    window.scrollTo(0, document.body.scrollHeight || document.documentElement.scrollHeight);
+                } else scrollContainer.scrollTop = scrollContainer.scrollHeight;
+            } catch (e) { }
+
+            scrollAttempts++;
+            const mutated = await waitForMutations(scrollContainer, 4500);
+            if (mutated) { await sleep(400); continue; }
+            else {
+                noNewDataRetries++;
+                if (noNewDataRetries >= maxNoNewDataRetries) break;
+                try {
+                    if (scrollContainer === window) {
+                        window.scrollBy(0, -60); await sleep(200); window.scrollBy(0, 120);
+                    } else {
+                        scrollContainer.scrollTop = Math.max(0, scrollContainer.scrollTop - 60);
+                        await sleep(200);
+                        scrollContainer.scrollTop = scrollContainer.scrollHeight;
+                    }
+                    const mutated2 = await waitForMutations(scrollContainer, 3000);
+                    if (mutated2) { await sleep(300); continue; }
+                } catch (e) { }
+                await sleep(500);
+            }
+        }
+
+        // finalize export
+        const endTimestamp = Date.now();
+        const timeTakenSec = (endTimestamp - startTimestamp) / 1000;
+        const timeTakenHuman = humanDuration(timeTakenSec);
+        const nowDate = new Date();
+        const dateStr = formatDateInput(nowDate);
+
+        if (format === 'csv') {
+            downloadFile(toCSV(collected), `${filenamePrefix}_${dateStr}.csv`, 'text/csv');
+        } else {
+            const jsonData = {
+                exportedAt: nowDate.toISOString(),
+                startDate: formatDateInput(startDate),
+                endDate: formatDateInput(endDate),
+                actualFirstScanned: scannedMaxDate ? formatDateInput(scannedMaxDate) : null,
+                actualLastScanned: scannedMinDate ? formatDateInput(scannedMinDate) : null,
+                timeTakenSeconds: timeTakenSec,
+                timeTakenHuman,
+                category,
+                pageUrl,
+                stats: calcStats ? calculateStats(collected) : {},
+                transactions: collected
+            };
+            downloadFile(JSON.stringify(jsonData, null, 2), `${filenamePrefix}_${dateStr}.json`, 'application/json');
+        }
+
+        console.log(`Export complete. Total transactions exported: ${collected.length}. Time taken: ${timeTakenHuman}`);
+        if (onProgress) onProgress(1); // ensure progress bar reaches 100%
+    }
 
     // --- Init ---
     createOverlay();
