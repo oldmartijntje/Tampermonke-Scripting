@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ASN Bank History Saver
 // @namespace    http://tampermonkey.net/
-// @version      1.12
-// @description  Export bank transactions with date range, format options, and optional statistics. Tracks actual first/last scanned dates and duration + ETA estimation.
+// @version      1.14
+// @description  Export bank transactions with date range, format options, and optional statistics. Tracks actual first/last scanned dates and duration + ETA estimation. Bank selection included.
 // @match        https://www.regiobank.nl/online/web/mijnregiobank/*
 // @match        https://www.snsbank.nl/online/web/mijnsns/*
 // @match        https://www.asnbank.nl/online/web/*
@@ -39,7 +39,6 @@
     }
 
     function formatDateInput(d) { return d.toISOString().split('T')[0]; }
-
     function normalizeDescription(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
     function normalizeAmount(a) { return Math.round(a * 100) / 100; }
 
@@ -58,9 +57,7 @@
                     const amount = normalizeAmount(rawAmount);
                     transactions.push({ date, description, amount });
                 }
-            } catch (e) {
-                console.error('Error parsing tx element', e);
-            }
+            } catch (e) { console.error('Error parsing tx element', e); }
         });
         return transactions;
     }
@@ -99,7 +96,6 @@
         };
     }
 
-    // --- Utilities ---
     function sleep(ms) { return new Promise(res => setTimeout(res, ms)); }
 
     function findScrollContainer() {
@@ -149,7 +145,6 @@
         return `${s}s`;
     }
 
-    // --- Overlay UI with progress bar ---
     function createOverlay() {
         const overlay = document.createElement('div');
         overlay.style.position = 'fixed';
@@ -163,17 +158,87 @@
         overlay.style.boxShadow = '0 4px 10px rgba(0,0,0,0.2)';
         overlay.style.fontFamily = 'sans-serif';
         overlay.style.fontSize = '14px';
+        overlay.style.width = '320px';
+        overlay.style.maxHeight = '90vh';
+        overlay.style.overflow = 'auto';
 
-        const today = new Date();
-        const tomorrow = new Date(today); tomorrow.setDate(today.getDate() + 1);
-        const startOfYear = new Date(today.getFullYear(), 0, 1);
+        // --- Minimize/Close ---
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.textContent = '–';
+        minimizeBtn.style.position = 'absolute';
+        minimizeBtn.style.top = '5px';
+        minimizeBtn.style.right = '35px';
+        minimizeBtn.style.width = '25px';
+        minimizeBtn.style.height = '25px';
+        minimizeBtn.style.cursor = 'pointer';
+        overlay.appendChild(minimizeBtn);
+
+        const closeBtn = document.createElement('button');
+        closeBtn.textContent = '×';
+        closeBtn.style.position = 'absolute';
+        closeBtn.style.top = '5px';
+        closeBtn.style.right = '5px';
+        closeBtn.style.width = '25px';
+        closeBtn.style.height = '25px';
+        closeBtn.style.cursor = 'pointer';
+        overlay.appendChild(closeBtn);
+
+        const restoreBtn = document.createElement('button');
+        restoreBtn.textContent = '▲ ASN Export';
+        restoreBtn.style.position = 'fixed';
+        restoreBtn.style.top = '5px';
+        restoreBtn.style.left = '5px';
+        restoreBtn.style.zIndex = '999999';
+        restoreBtn.style.display = 'none';
+        restoreBtn.style.cursor = 'pointer';
+        restoreBtn.style.padding = '5px 10px';
+        restoreBtn.style.borderRadius = '5px';
+        restoreBtn.style.border = '1px solid #ccc';
+        restoreBtn.style.background = 'white';
+        document.body.appendChild(restoreBtn);
+
+        minimizeBtn.addEventListener('click', () => {
+            overlay.style.display = 'none';
+            restoreBtn.style.display = 'block';
+        });
+        restoreBtn.addEventListener('click', () => {
+            overlay.style.display = 'block';
+            restoreBtn.style.display = 'none';
+        });
+        closeBtn.addEventListener('click', () => {
+            overlay.remove();
+            restoreBtn.remove();
+        });
 
         const title = document.createElement('h3');
         title.textContent = 'ASN Bank History Saver';
         title.style.margin = '0 0 10px 0';
         overlay.appendChild(title);
 
-        // --- Inputs ---
+        const today = new Date();
+        const tomorrow = new Date(today); tomorrow.setDate(today.getDate() + 1);
+        const startOfYear = new Date(today.getFullYear(), 0, 1);
+
+        // --- Bank Selection ---
+        const bankLabel = document.createElement('label');
+        bankLabel.textContent = 'Bank: ';
+        const bankSelect = document.createElement('select');
+        ['ASN Bank', 'SNS Bank', 'RegioBank'].forEach(name => {
+            const opt = document.createElement('option');
+            opt.value = name;
+            opt.textContent = name;
+            bankSelect.appendChild(opt);
+        });
+        const url = window.location.href.toLowerCase();
+        if (url.includes('asnbank')) bankSelect.value = 'ASN Bank';
+        else if (url.includes('snsbank')) bankSelect.value = 'SNS Bank';
+        else if (url.includes('regiobank')) bankSelect.value = 'RegioBank';
+        bankLabel.appendChild(bankSelect);
+        overlay.appendChild(bankLabel);
+        overlay.appendChild(document.createElement('br'));
+        overlay.appendChild(document.createElement('br'));
+
+        // --- Other Inputs ---
         const createInput = (labelText, type, defaultValue) => {
             const label = document.createElement('label');
             label.textContent = labelText;
@@ -201,9 +266,16 @@
         formatLabel.appendChild(formatSelect);
         overlay.appendChild(formatLabel); overlay.appendChild(document.createElement('br')); overlay.appendChild(document.createElement('br'));
 
-        const statsLabel = document.createElement('label'); statsLabel.textContent = 'Calculated Statistics: ';
-        const statsCheckbox = document.createElement('input'); statsCheckbox.type = 'checkbox';
-        statsLabel.appendChild(statsCheckbox); overlay.appendChild(statsLabel); overlay.appendChild(document.createElement('br')); overlay.appendChild(document.createElement('br'));
+        const statsLabel = document.createElement('label');
+        statsLabel.textContent = 'Calculated Statistics: ';
+        const statsCheckbox = document.createElement('input');
+        statsCheckbox.type = 'checkbox';
+        statsCheckbox.checked = true;
+        statsLabel.appendChild(statsCheckbox);
+        overlay.appendChild(statsLabel);
+        overlay.appendChild(document.createElement('br'));
+        overlay.appendChild(document.createElement('br'));
+
 
         // --- Progress Bar ---
         const progressContainer = document.createElement('div');
@@ -232,7 +304,7 @@
         document.body.appendChild(overlay);
 
         function setInputsDisabled(disabled) {
-            [nameInput, categoryInput, startInput, endInput, formatSelect, statsCheckbox, exportBtn].forEach(el => el.disabled = disabled);
+            [nameInput, categoryInput, startInput, endInput, formatSelect, statsCheckbox, exportBtn, bankSelect].forEach(el => el.disabled = disabled);
         }
 
         exportBtn.addEventListener('click', () => {
@@ -242,20 +314,20 @@
             const calcStats = statsCheckbox.checked;
             const filenamePrefix = (nameInput.value || 'export').trim();
             const category = (categoryInput.value || '').trim();
-            const pageUrl = window.location.href; // automatically save current page URL
+            const bank = bankSelect.value; // pass bank value
+            const pageUrl = window.location.href;
 
             setInputsDisabled(true);
             progressBar.style.width = '0%';
 
-            // Wrap original loader to report progress
-            loadAllTransactions(startDate, endDate, format, calcStats, filenamePrefix, category, pageUrl, (progressFraction) => {
-                progressBar.style.width = `${Math.round(progressFraction * 100)}%`;
-            }).finally(() => setInputsDisabled(false));
+            loadAllTransactions(
+                startDate, endDate, format, calcStats, filenamePrefix, category, pageUrl, bank,
+                (progressFraction) => { progressBar.style.width = `${Math.round(progressFraction * 100)}%`; }
+            ).finally(() => setInputsDisabled(false));
         });
     }
 
-    // --- Loader update to support progress callback ---
-    async function loadAllTransactions(startDate, endDate, format, calcStats, filenamePrefix, category, pageUrl, onProgress) {
+    async function loadAllTransactions(startDate, endDate, format, calcStats, filenamePrefix, category, pageUrl, bank, onProgress) {
         const collected = [];
         const seenKeys = new Set();
         const scrollContainer = findScrollContainer();
@@ -270,7 +342,6 @@
         let scannedMinDate = null;
         let scannedMaxDate = null;
         const startTimestamp = Date.now();
-        const msPerDay = 1000 * 60 * 60 * 24;
 
         const keyFor = (t) => `${t.date.toISOString().split('T')[0]}|${t.description}|${t.amount.toFixed(2)}`;
 
@@ -291,26 +362,17 @@
             if (!scannedMinDate || oldestOnPage < scannedMinDate) scannedMinDate = oldestOnPage;
             if (!scannedMaxDate || newestOnPage > scannedMaxDate) scannedMaxDate = newestOnPage;
 
-            let newUniqueAdded = false;
             txs.forEach(t => {
                 const key = keyFor(t);
                 if (!seenKeys.has(key)) {
                     seenKeys.add(key);
                     if (t.date >= endDate && t.date <= startDate) collected.push(t);
-                    newUniqueAdded = true;
                 }
             });
 
-            let progressed = false;
-            if (!prevOldestSeen) {
-                prevOldestSeen = oldestOnPage;
-                progressed = true;
-            } else if (oldestOnPage < prevOldestSeen) {
-                prevOldestSeen = oldestOnPage;
-                progressed = true;
-            }
+            if (!prevOldestSeen) prevOldestSeen = oldestOnPage;
+            else if (oldestOnPage < prevOldestSeen) prevOldestSeen = oldestOnPage;
 
-            // update progress
             if (onProgress && scannedMinDate && scannedMaxDate) {
                 const totalRange = startDate - endDate;
                 const covered = scannedMaxDate - scannedMinDate;
@@ -318,15 +380,11 @@
                 onProgress(fraction);
             }
 
-            const now = Date.now();
-            const elapsedSec = (now - startTimestamp) / 1000;
-
             if (oldestOnPage < endDate || scrollAttempts >= maxScrollAttempts) break;
 
             try {
-                if (scrollContainer === window) {
-                    window.scrollTo(0, document.body.scrollHeight || document.documentElement.scrollHeight);
-                } else scrollContainer.scrollTop = scrollContainer.scrollHeight;
+                if (scrollContainer === window) window.scrollTo(0, document.body.scrollHeight || document.documentElement.scrollHeight);
+                else scrollContainer.scrollTop = scrollContainer.scrollHeight;
             } catch (e) { }
 
             scrollAttempts++;
@@ -350,7 +408,6 @@
             }
         }
 
-        // finalize export
         const endTimestamp = Date.now();
         const timeTakenSec = (endTimestamp - startTimestamp) / 1000;
         const timeTakenHuman = humanDuration(timeTakenSec);
@@ -369,6 +426,7 @@
                 timeTakenSeconds: timeTakenSec,
                 timeTakenHuman,
                 category,
+                bank,
                 pageUrl,
                 stats: calcStats ? calculateStats(collected) : {},
                 transactions: collected
@@ -377,9 +435,8 @@
         }
 
         console.log(`Export complete. Total transactions exported: ${collected.length}. Time taken: ${timeTakenHuman}`);
-        if (onProgress) onProgress(1); // ensure progress bar reaches 100%
+        if (onProgress) onProgress(1);
     }
 
-    // --- Init ---
     createOverlay();
 })();
